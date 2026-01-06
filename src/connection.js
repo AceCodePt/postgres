@@ -78,6 +78,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
 
   let socket = null
     , cancelMessage
+    , errorResponse = null
     , result = new Result()
     , incoming = Buffer.alloc(0)
     , needsTypes = options.fetch_types
@@ -155,10 +156,10 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   function execute(q) {
     if (terminated)
       return queryError(q, Errors.connection('CONNECTION_DESTROYED', options))
-    
+
     if (stream)
       return queryError(q, Errors.generic('COPY_IN_PROGRESS', 'You cannot execute queries during copy'))
-    
+
     if (q.cancelled)
       return
 
@@ -266,24 +267,24 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     if (sslnegotiation !== 'direct') {
       write(SSLRequest)
       const canSSL = await new Promise(r => socket.once('data', x => r(x[0] === 83))) // S
-  
+
       if (!canSSL && ssl === 'prefer')
         return connected()
     }
-    
+
     const options = {
       socket,
-      servername: net.isIP(socket.host) ? undefined : socket.host,
+      servername: net.isIP(socket.host) ? undefined : socket.host
     }
-    
+
     if (sslnegotiation === 'direct')
       options.ALPNProtocols = ['postgresql']
-    
+
     if (ssl === 'require' || ssl === 'allow' || ssl === 'prefer')
       options.rejectUnauthorized = false
     else if (typeof ssl === 'object')
       Object.assign(options, ssl)
-    
+
     socket.removeAllListeners()
     socket = tls.connect(options)
     socket.on('secureConnect', connected)
@@ -532,8 +533,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   }
 
   function ReadyForQuery(x) {
-    query && query.options.simple && query.resolve(results || result)
-    query = results = null
+    if (query) {
+      if (errorResponse) {
+        query.retried
+          ? errored(query.retried)
+          : query.prepared && retryRoutines.has(errorResponse.routine)
+            ? retry(query, errorResponse)
+            : errored(errorResponse)
+      } else {
+        query.resolve(results || result)
+      }
+    } else if (errorResponse) {
+      errored(errorResponse)
+    }
+
+    query = results = errorResponse = null
     result = new Result()
     connectTimer.cancel()
 
@@ -598,8 +612,6 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
       result.count && query.cursorFn(result)
       write(Sync)
     }
-
-    query.resolve(result)
   }
 
   function ParseComplete() {
@@ -798,13 +810,12 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   }
 
   function ErrorResponse(x) {
-    query && (query.cursorFn || query.describeFirst) && write(Sync)
-    const error = Errors.postgres(parseError(x))
-    query && query.retried
-      ? errored(query.retried)
-      : query && query.prepared && retryRoutines.has(error.routine)
-        ? retry(query, error)
-        : errored(error)
+    if (query) {
+      (query.cursorFn || query.describeFirst) && write(Sync)
+      errorResponse = Errors.postgres(parseError(x))
+    } else {
+      errored(Errors.postgres(parseError(x)))
+    }
   }
 
   function retry(q, error) {
